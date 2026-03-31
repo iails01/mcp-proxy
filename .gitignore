@@ -143,4 +143,6 @@ fabric.properties
 /mcp-proxy
 /build
 /dist
+/logs
+config.local.json
 config_prod.json

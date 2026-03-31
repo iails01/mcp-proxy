@@ -7,6 +7,8 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mark3labs/mcp-go/client"
@@ -15,18 +17,41 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
+type upstreamClient interface {
+	Start(ctx context.Context) error
+	Initialize(ctx context.Context, request mcp.InitializeRequest) (*mcp.InitializeResult, error)
+	Ping(ctx context.Context) error
+	ListTools(ctx context.Context, request mcp.ListToolsRequest) (*mcp.ListToolsResult, error)
+	CallTool(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error)
+	ListPrompts(ctx context.Context, request mcp.ListPromptsRequest) (*mcp.ListPromptsResult, error)
+	GetPrompt(ctx context.Context, request mcp.GetPromptRequest) (*mcp.GetPromptResult, error)
+	ListResources(ctx context.Context, request mcp.ListResourcesRequest) (*mcp.ListResourcesResult, error)
+	ReadResource(ctx context.Context, request mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error)
+	ListResourceTemplates(ctx context.Context, request mcp.ListResourceTemplatesRequest) (*mcp.ListResourceTemplatesResult, error)
+	Close() error
+	OnConnectionLost(handler func(error))
+}
+
 type Client struct {
 	name            string
 	needPing        bool
 	needManualStart bool
-	client          *client.Client
+	client          upstreamClient
+	newClient       func() (upstreamClient, error)
+	initRequest     *mcp.InitializeRequest
 	options         *OptionsV2
+	clientMu        sync.RWMutex
+	reconnectMu     sync.Mutex
+	connectionLost  atomic.Bool
 }
 
-func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
+var transientConnectRetryDelay = 2 * time.Second
+var transientConnectMaxAttempts = 4
+
+func buildUpstreamClient(conf *MCPClientConfigV2) (upstreamClient, bool, bool, error) {
 	clientInfo, pErr := parseMCPClientConfigV2(conf)
 	if pErr != nil {
-		return nil, pErr
+		return nil, false, false, pErr
 	}
 	switch v := clientInfo.(type) {
 	case *StdioMCPClientConfig:
@@ -36,14 +61,10 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 		}
 		mcpClient, err := client.NewStdioMCPClient(v.Command, envs, v.Args...)
 		if err != nil {
-			return nil, err
+			return nil, false, false, err
 		}
 
-		return &Client{
-			name:    name,
-			client:  mcpClient,
-			options: conf.Options,
-		}, nil
+		return mcpClient, false, false, nil
 	case *SSEMCPClientConfig:
 		var options []transport.ClientOption
 		if len(v.Headers) > 0 {
@@ -51,15 +72,9 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 		}
 		mcpClient, err := client.NewSSEMCPClient(v.URL, options...)
 		if err != nil {
-			return nil, err
+			return nil, false, false, err
 		}
-		return &Client{
-			name:            name,
-			needPing:        true,
-			needManualStart: true,
-			client:          mcpClient,
-			options:         conf.Options,
-		}, nil
+		return mcpClient, true, true, nil
 	case *StreamableMCPClientConfig:
 		var options []transport.StreamableHTTPCOption
 		if len(v.Headers) > 0 {
@@ -70,26 +85,243 @@ func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
 		}
 		mcpClient, err := client.NewStreamableHttpClient(v.URL, options...)
 		if err != nil {
-			return nil, err
+			return nil, false, false, err
 		}
-		return &Client{
-			name:            name,
-			needPing:        true,
-			needManualStart: true,
-			client:          mcpClient,
-			options:         conf.Options,
-		}, nil
+		return mcpClient, true, true, nil
 	}
-	return nil, errors.New("invalid client type")
+	return nil, false, false, errors.New("invalid client type")
 }
 
-func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementation, mcpServer *server.MCPServer) error {
-	if c.needManualStart {
-		err := c.client.Start(ctx)
-		if err != nil {
+func newMCPClient(name string, conf *MCPClientConfigV2) (*Client, error) {
+	rawClient, needPing, needManualStart, err := buildUpstreamClient(conf)
+	if err != nil {
+		return nil, err
+	}
+
+	c := &Client{
+		name:            name,
+		needPing:        needPing,
+		needManualStart: needManualStart,
+		client:          rawClient,
+		options:         conf.Options,
+	}
+	c.newClient = func() (upstreamClient, error) {
+		nextClient, _, _, newErr := buildUpstreamClient(conf)
+		return nextClient, newErr
+	}
+	c.attachConnectionLostHandler(rawClient)
+	return c, nil
+}
+
+func (c *Client) attachConnectionLostHandler(current upstreamClient) {
+	current.OnConnectionLost(func(err error) {
+		log.Printf("<%s> Connection lost: %v", c.name, err)
+		c.connectionLost.Store(true)
+	})
+}
+
+func (c *Client) currentClient() upstreamClient {
+	c.clientMu.RLock()
+	defer c.clientMu.RUnlock()
+	return c.client
+}
+
+func (c *Client) setClient(next upstreamClient) {
+	c.clientMu.Lock()
+	defer c.clientMu.Unlock()
+	c.client = next
+}
+
+func (c *Client) shouldReconnect(err error) bool {
+	if err == nil {
+		return false
+	}
+	if c.connectionLost.Load() {
+		return true
+	}
+
+	errText := strings.ToLower(err.Error())
+	reconnectHints := []string{
+		"no active sse connection",
+		"connection has been closed",
+		"transport has been closed",
+		"transport not started yet",
+		"endpoint not received",
+		"sse stream error",
+		"unexpected status code: 429",
+		"unexpected status code: 503",
+		"concurrent request count exceeded",
+		"resourceexhausted",
+	}
+	for _, hint := range reconnectHints {
+		if strings.Contains(errText, hint) {
+			return true
+		}
+	}
+	return false
+}
+
+func waitForRetry(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return ctx.Err()
+	}
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (c *Client) startAndInitializeWithRetry(ctx context.Context, current upstreamClient, phase string) error {
+	attempts := transientConnectMaxAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if c.needManualStart {
+			if err := current.Start(ctx); err != nil {
+				lastErr = err
+			} else {
+				lastErr = nil
+			}
+		}
+
+		if lastErr == nil {
+			if _, err := current.Initialize(ctx, *c.initRequest); err != nil {
+				lastErr = err
+			}
+		}
+
+		if lastErr == nil {
+			return nil
+		}
+
+		if !c.shouldReconnect(lastErr) || attempt == attempts {
+			return lastErr
+		}
+
+		log.Printf("<%s> %s transient failure, retrying in %s (attempt %d/%d): %v", c.name, phase, transientConnectRetryDelay, attempt, attempts, lastErr)
+		if err := waitForRetry(ctx, transientConnectRetryDelay); err != nil {
 			return err
 		}
 	}
+
+	return lastErr
+}
+
+func (c *Client) reconnect(ctx context.Context) error {
+	c.reconnectMu.Lock()
+	defer c.reconnectMu.Unlock()
+
+	if c.initRequest == nil {
+		return errors.New("client has not been initialized yet")
+	}
+
+	oldClient := c.currentClient()
+	if oldClient != nil {
+		if err := oldClient.Close(); err != nil {
+			log.Printf("<%s> Failed to close stale client during reconnect: %v", c.name, err)
+		}
+	}
+
+	log.Printf("<%s> Reconnect starting", c.name)
+	nextClient, err := c.newClient()
+	if err != nil {
+		log.Printf("<%s> Reconnect failed while building client: %v", c.name, err)
+		return err
+	}
+	c.attachConnectionLostHandler(nextClient)
+
+	if err := c.startAndInitializeWithRetry(ctx, nextClient, "Reconnect"); err != nil {
+		_ = nextClient.Close()
+		log.Printf("<%s> Reconnect failed during Start/Initialize: %v", c.name, err)
+		return err
+	}
+
+	c.setClient(nextClient)
+	c.connectionLost.Store(false)
+	log.Printf("<%s> Reconnected MCP client", c.name)
+	return nil
+}
+
+func callWithReconnect[T any](c *Client, ctx context.Context, operation func(upstreamClient) (T, error)) (T, error) {
+	current := c.currentClient()
+	if current == nil {
+		var zero T
+		return zero, errors.New("upstream client is not available")
+	}
+
+	result, err := operation(current)
+	if err == nil || !c.shouldReconnect(err) {
+		return result, err
+	}
+
+	log.Printf("<%s> Reconnect triggered after operation error: %v", c.name, err)
+	if reconnectErr := c.reconnect(ctx); reconnectErr != nil {
+		var zero T
+		return zero, errors.Join(err, fmt.Errorf("reconnect failed: %w", reconnectErr))
+	}
+
+	return operation(c.currentClient())
+}
+
+func (c *Client) listTools(ctx context.Context, request mcp.ListToolsRequest) (*mcp.ListToolsResult, error) {
+	return callWithReconnect(c, ctx, func(current upstreamClient) (*mcp.ListToolsResult, error) {
+		return current.ListTools(ctx, request)
+	})
+}
+
+func (c *Client) listPrompts(ctx context.Context, request mcp.ListPromptsRequest) (*mcp.ListPromptsResult, error) {
+	return callWithReconnect(c, ctx, func(current upstreamClient) (*mcp.ListPromptsResult, error) {
+		return current.ListPrompts(ctx, request)
+	})
+}
+
+func (c *Client) listResources(ctx context.Context, request mcp.ListResourcesRequest) (*mcp.ListResourcesResult, error) {
+	return callWithReconnect(c, ctx, func(current upstreamClient) (*mcp.ListResourcesResult, error) {
+		return current.ListResources(ctx, request)
+	})
+}
+
+func (c *Client) listResourceTemplates(ctx context.Context, request mcp.ListResourceTemplatesRequest) (*mcp.ListResourceTemplatesResult, error) {
+	return callWithReconnect(c, ctx, func(current upstreamClient) (*mcp.ListResourceTemplatesResult, error) {
+		return current.ListResourceTemplates(ctx, request)
+	})
+}
+
+func (c *Client) callTool(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return callWithReconnect(c, ctx, func(current upstreamClient) (*mcp.CallToolResult, error) {
+		return current.CallTool(ctx, request)
+	})
+}
+
+func (c *Client) getPrompt(ctx context.Context, request mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
+	return callWithReconnect(c, ctx, func(current upstreamClient) (*mcp.GetPromptResult, error) {
+		return current.GetPrompt(ctx, request)
+	})
+}
+
+func (c *Client) readResource(ctx context.Context, request mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+	return callWithReconnect(c, ctx, func(current upstreamClient) (*mcp.ReadResourceResult, error) {
+		return current.ReadResource(ctx, request)
+	})
+}
+
+func (c *Client) ping(ctx context.Context) error {
+	_, err := callWithReconnect(c, ctx, func(current upstreamClient) (struct{}, error) {
+		return struct{}{}, current.Ping(ctx)
+	})
+	return err
+}
+
+func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementation, mcpServer *server.MCPServer) error {
 	initRequest := mcp.InitializeRequest{}
 	initRequest.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
 	initRequest.Params.ClientInfo = clientInfo
@@ -98,10 +330,13 @@ func (c *Client) addToMCPServer(ctx context.Context, clientInfo mcp.Implementati
 		Roots:        nil,
 		Sampling:     nil,
 	}
-	_, err := c.client.Initialize(ctx, initRequest)
+	c.initRequest = &initRequest
+
+	err := c.startAndInitializeWithRetry(ctx, c.currentClient(), "Startup")
 	if err != nil {
 		return err
 	}
+	c.connectionLost.Store(false)
 	log.Printf("<%s> Successfully initialized MCP client", c.name)
 
 	err = c.addToolsToServer(ctx, mcpServer)
@@ -130,17 +365,27 @@ func (c *Client) startPingTask(ctx context.Context) {
 			log.Printf("<%s> Context done, stopping ping", c.name)
 			return
 		case <-ticker.C:
-			if err := c.client.Ping(ctx); err != nil {
-				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-					return
-				}
-				failCount++
-				log.Printf("<%s> MCP Ping failed: %v (count=%d)", c.name, err, failCount)
-			} else if failCount > 0 {
-				log.Printf("<%s> MCP Ping recovered after %d failures", c.name, failCount)
-				failCount = 0
-			}
+			c.pingOnce(ctx, &failCount)
 		}
+	}
+}
+
+func (c *Client) pingOnce(ctx context.Context, failCount *int) {
+	if err := c.ping(ctx); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return
+		}
+		if c.shouldReconnect(err) {
+			log.Printf("<%s> Ping returned reconnect-worthy error after wrapper: %v", c.name, err)
+		}
+		*failCount++
+		log.Printf("<%s> MCP Ping failed: %v (count=%d)", c.name, err, *failCount)
+		return
+	}
+
+	if *failCount > 0 {
+		log.Printf("<%s> MCP Ping recovered after %d failures", c.name, *failCount)
+		*failCount = 0
 	}
 }
 
@@ -179,7 +424,7 @@ func (c *Client) addToolsToServer(ctx context.Context, mcpServer *server.MCPServ
 	}
 
 	for {
-		tools, err := c.client.ListTools(ctx, toolsRequest)
+		tools, err := c.listTools(ctx, toolsRequest)
 		if err != nil {
 			return err
 		}
@@ -193,7 +438,7 @@ func (c *Client) addToolsToServer(ctx context.Context, mcpServer *server.MCPServ
 		for _, tool := range tools.Tools {
 			if filterFunc(tool.Name) {
 				log.Printf("<%s> Adding tool %s", c.name, tool.Name)
-				mcpServer.AddTool(tool, c.client.CallTool)
+				mcpServer.AddTool(tool, c.callTool)
 			}
 		}
 		if tools.NextCursor == "" {
@@ -208,7 +453,7 @@ func (c *Client) addToolsToServer(ctx context.Context, mcpServer *server.MCPServ
 func (c *Client) addPromptsToServer(ctx context.Context, mcpServer *server.MCPServer) error {
 	promptsRequest := mcp.ListPromptsRequest{}
 	for {
-		prompts, err := c.client.ListPrompts(ctx, promptsRequest)
+		prompts, err := c.listPrompts(ctx, promptsRequest)
 		if err != nil {
 			return err
 		}
@@ -221,7 +466,7 @@ func (c *Client) addPromptsToServer(ctx context.Context, mcpServer *server.MCPSe
 		log.Printf("<%s> Successfully listed %d prompts", c.name, len(prompts.Prompts))
 		for _, prompt := range prompts.Prompts {
 			log.Printf("<%s> Adding prompt %s", c.name, prompt.Name)
-			mcpServer.AddPrompt(prompt, c.client.GetPrompt)
+			mcpServer.AddPrompt(prompt, c.getPrompt)
 		}
 		if prompts.NextCursor == "" {
 			break
@@ -234,7 +479,7 @@ func (c *Client) addPromptsToServer(ctx context.Context, mcpServer *server.MCPSe
 func (c *Client) addResourcesToServer(ctx context.Context, mcpServer *server.MCPServer) error {
 	resourcesRequest := mcp.ListResourcesRequest{}
 	for {
-		resources, err := c.client.ListResources(ctx, resourcesRequest)
+		resources, err := c.listResources(ctx, resourcesRequest)
 		if err != nil {
 			return err
 		}
@@ -248,7 +493,7 @@ func (c *Client) addResourcesToServer(ctx context.Context, mcpServer *server.MCP
 		for _, resource := range resources.Resources {
 			log.Printf("<%s> Adding resource %s", c.name, resource.Name)
 			mcpServer.AddResource(resource, func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-				readResource, e := c.client.ReadResource(ctx, request)
+				readResource, e := c.readResource(ctx, request)
 				if e != nil {
 					return nil, e
 				}
@@ -267,7 +512,7 @@ func (c *Client) addResourcesToServer(ctx context.Context, mcpServer *server.MCP
 func (c *Client) addResourceTemplatesToServer(ctx context.Context, mcpServer *server.MCPServer) error {
 	resourceTemplatesRequest := mcp.ListResourceTemplatesRequest{}
 	for {
-		resourceTemplates, err := c.client.ListResourceTemplates(ctx, resourceTemplatesRequest)
+		resourceTemplates, err := c.listResourceTemplates(ctx, resourceTemplatesRequest)
 		if err != nil {
 			return err
 		}
@@ -278,7 +523,7 @@ func (c *Client) addResourceTemplatesToServer(ctx context.Context, mcpServer *se
 		for _, resourceTemplate := range resourceTemplates.ResourceTemplates {
 			log.Printf("<%s> Adding resource template %s", c.name, resourceTemplate.Name)
 			mcpServer.AddResourceTemplate(resourceTemplate, func(ctx context.Context, request mcp.ReadResourceRequest) ([]mcp.ResourceContents, error) {
-				readResource, e := c.client.ReadResource(ctx, request)
+				readResource, e := c.readResource(ctx, request)
 				if e != nil {
 					return nil, e
 				}
@@ -294,8 +539,9 @@ func (c *Client) addResourceTemplatesToServer(ctx context.Context, mcpServer *se
 }
 
 func (c *Client) Close() error {
-	if c.client != nil {
-		return c.client.Close()
+	current := c.currentClient()
+	if current != nil {
+		return current.Close()
 	}
 	return nil
 }
