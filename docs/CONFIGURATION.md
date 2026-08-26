@@ -85,10 +85,13 @@ Common fields:
 - `toolFilter` (object): Selectively expose tools to the proxy:
   - `mode`: `allow` or `block`.
   - `list`: List of tool names.
+- `toolSchemaCompatibility` (object): Opt-in schema compatibility filters applied before tools are exposed:
+  - `removeOptionalEmptyStringEnumValues` (object): Remove the empty string from enum values on optional properties, together with a matching empty-string default.
+    - `enabled`: Enable this filter. Defaults to `false`.
+    - `tools`: Exact tool names to process. Use `"*"` for all tools; an empty list processes no tools.
 - `Disabled` (bool): Enable or disable this server. Disabled servers are skipped at startup.
 
 Notes:
 
 - `mcpProxy.options.authTokens` serves as the default token set if a server omits `options.authTokens`.
 - To discover tool names for filtering, start without a filter and check logs for lines like `<server> Adding tool <name>`.
-

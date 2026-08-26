@@ -394,6 +394,10 @@ func (c *Client) addToolsToServer(ctx context.Context, mcpServer *server.MCPServ
 	filterFunc := func(toolName string) bool {
 		return true
 	}
+	var toolSchemaCompatibility *ToolSchemaCompatibilityConfig
+	if c.options != nil {
+		toolSchemaCompatibility = c.options.ToolSchemaCompatibility
+	}
 
 	if c.options != nil && c.options.ToolFilter != nil && len(c.options.ToolFilter.List) > 0 {
 		filterSet := make(map[string]struct{})
@@ -437,6 +441,10 @@ func (c *Client) addToolsToServer(ctx context.Context, mcpServer *server.MCPServ
 		log.Printf("<%s> Successfully listed %d tools", c.name, len(tools.Tools))
 		for _, tool := range tools.Tools {
 			if filterFunc(tool.Name) {
+				tool, changes := applyToolSchemaCompatibility(tool, toolSchemaCompatibility)
+				for _, change := range changes {
+					log.Printf("<%s> Removed optional empty string enum value from tool %s property %s", c.name, tool.Name, change.Property)
+				}
 				log.Printf("<%s> Adding tool %s", c.name, tool.Name)
 				mcpServer.AddTool(tool, c.callTool)
 			}

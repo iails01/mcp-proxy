@@ -61,12 +61,22 @@ type ToolFilterConfig struct {
 	List []string       `json:"list,omitempty"`
 }
 
+type OptionalEmptyStringEnumFilterConfig struct {
+	Enabled bool     `json:"enabled,omitempty"`
+	Tools   []string `json:"tools,omitempty"`
+}
+
+type ToolSchemaCompatibilityConfig struct {
+	RemoveOptionalEmptyStringEnumValues *OptionalEmptyStringEnumFilterConfig `json:"removeOptionalEmptyStringEnumValues,omitempty"`
+}
+
 type OptionsV2 struct {
-	PanicIfInvalid optional.Field[bool] `json:"panicIfInvalid"`
-	LogEnabled     optional.Field[bool] `json:"logEnabled"`
-	AuthTokens     []string             `json:"authTokens,omitempty"`
-	ToolFilter     *ToolFilterConfig    `json:"toolFilter,omitempty"`
-	Disabled       bool                 `json:"disabled,omitempty"`
+	PanicIfInvalid          optional.Field[bool]           `json:"panicIfInvalid"`
+	LogEnabled              optional.Field[bool]           `json:"logEnabled"`
+	AuthTokens              []string                       `json:"authTokens,omitempty"`
+	ToolFilter              *ToolFilterConfig              `json:"toolFilter,omitempty"`
+	ToolSchemaCompatibility *ToolSchemaCompatibilityConfig `json:"toolSchemaCompatibility,omitempty"`
+	Disabled                bool                           `json:"disabled,omitempty"`
 }
 
 type MCPProxyConfigV2 struct {
