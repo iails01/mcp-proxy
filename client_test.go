@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	mcpclient "github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -19,6 +20,7 @@ type fakeUpstreamClient struct {
 	startErrs       []error
 	initializeErrs  []error
 	pingErr         error
+	pingWaitForDone bool
 	callToolErr     error
 	callToolResult  *mcp.CallToolResult
 }
@@ -47,8 +49,12 @@ func (f *fakeUpstreamClient) Initialize(context.Context, mcp.InitializeRequest) 
 	}, nil
 }
 
-func (f *fakeUpstreamClient) Ping(context.Context) error {
+func (f *fakeUpstreamClient) Ping(ctx context.Context) error {
 	f.pingCalls++
+	if f.pingWaitForDone {
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	return f.pingErr
 }
 
@@ -143,6 +149,54 @@ func TestCallToolReconnectsAfterStaleSessionError(t *testing.T) {
 	}
 }
 
+func TestCallToolReconnectsAfterTransportClosedError(t *testing.T) {
+	oldClient := &fakeUpstreamClient{
+		callToolErr: errors.New("transport error: transport closed"),
+	}
+	newClient := &fakeUpstreamClient{
+		callToolResult: &mcp.CallToolResult{
+			Content: []mcp.Content{mcp.NewTextContent("ok")},
+		},
+	}
+
+	var factoryCalls int
+	proxyClient := &Client{
+		name:            "nebula",
+		client:          oldClient,
+		needManualStart: false,
+		newClient: func() (upstreamClient, error) {
+			factoryCalls++
+			return newClient, nil
+		},
+		initRequest: &mcp.InitializeRequest{
+			Params: mcp.InitializeParams{
+				ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+				ClientInfo:      mcp.Implementation{Name: "proxy", Version: "1.0.0"},
+			},
+		},
+	}
+
+	result, err := proxyClient.callTool(context.Background(), mcp.CallToolRequest{})
+	if err != nil {
+		t.Fatalf("expected reconnect retry to succeed, got error: %v", err)
+	}
+	if factoryCalls != 1 {
+		t.Fatalf("expected one reconnect, got %d", factoryCalls)
+	}
+	if oldClient.closeCalls != 1 {
+		t.Fatalf("expected stale client to be closed once, got %d", oldClient.closeCalls)
+	}
+	if newClient.initializeCalls != 1 {
+		t.Fatalf("expected replacement client to initialize once, got init=%d", newClient.initializeCalls)
+	}
+	if newClient.callToolCalls != 1 {
+		t.Fatalf("expected replacement client to handle retried tool call once, got %d", newClient.callToolCalls)
+	}
+	if len(result.Content) != 1 {
+		t.Fatalf("expected tool content after reconnect, got %#v", result.Content)
+	}
+}
+
 func TestPingOnceReconnectsAfterStaleSessionError(t *testing.T) {
 	oldClient := &fakeUpstreamClient{
 		pingErr: errors.New("request failed with status 503: No active SSE connection"),
@@ -180,6 +234,95 @@ func TestPingOnceReconnectsAfterStaleSessionError(t *testing.T) {
 	}
 	if newClient.startCalls != 1 || newClient.initializeCalls != 1 {
 		t.Fatalf("expected replacement client to start and initialize once, got start=%d init=%d", newClient.startCalls, newClient.initializeCalls)
+	}
+}
+
+func TestPingOnceReconnectsAfterUnauthorizedError(t *testing.T) {
+	oldClient := &fakeUpstreamClient{
+		pingErr: errors.New("transport error: unauthorized (401)"),
+	}
+	newClient := &fakeUpstreamClient{}
+
+	var factoryCalls int
+	proxyClient := &Client{
+		name:            "dms",
+		client:          oldClient,
+		needManualStart: true,
+		newClient: func() (upstreamClient, error) {
+			factoryCalls++
+			return newClient, nil
+		},
+		initRequest: &mcp.InitializeRequest{
+			Params: mcp.InitializeParams{
+				ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+				ClientInfo:      mcp.Implementation{Name: "proxy", Version: "1.0.0"},
+			},
+		},
+	}
+
+	failCount := 0
+	proxyClient.pingOnce(context.Background(), &failCount)
+
+	if factoryCalls != 1 {
+		t.Fatalf("expected one reconnect on unauthorized ping failure, got %d", factoryCalls)
+	}
+	if failCount != 0 {
+		t.Fatalf("expected fail count to reset after successful reconnect, got %d", failCount)
+	}
+	if oldClient.closeCalls != 1 {
+		t.Fatalf("expected unauthorized client to be closed once, got %d", oldClient.closeCalls)
+	}
+	if newClient.startCalls != 1 || newClient.initializeCalls != 1 {
+		t.Fatalf("expected replacement client to start and initialize once, got start=%d init=%d", newClient.startCalls, newClient.initializeCalls)
+	}
+}
+
+func TestPingOnceReconnectsAfterHealthCheckTimeout(t *testing.T) {
+	oldTimeout := healthCheckTimeout
+	healthCheckTimeout = time.Nanosecond
+	defer func() {
+		healthCheckTimeout = oldTimeout
+	}()
+
+	oldClient := &fakeUpstreamClient{
+		pingWaitForDone: true,
+	}
+	newClient := &fakeUpstreamClient{}
+
+	var factoryCalls int
+	proxyClient := &Client{
+		name:            "log-search",
+		client:          oldClient,
+		needManualStart: false,
+		newClient: func() (upstreamClient, error) {
+			factoryCalls++
+			return newClient, nil
+		},
+		initRequest: &mcp.InitializeRequest{
+			Params: mcp.InitializeParams{
+				ProtocolVersion: mcp.LATEST_PROTOCOL_VERSION,
+				ClientInfo:      mcp.Implementation{Name: "proxy", Version: "1.0.0"},
+			},
+		},
+	}
+
+	failCount := 0
+	proxyClient.pingOnce(context.Background(), &failCount)
+
+	if factoryCalls != 1 {
+		t.Fatalf("expected one reconnect on health-check timeout, got %d", factoryCalls)
+	}
+	if failCount != 0 {
+		t.Fatalf("expected fail count to reset after successful reconnect, got %d", failCount)
+	}
+	if oldClient.closeCalls != 1 {
+		t.Fatalf("expected timed-out client to be closed once, got %d", oldClient.closeCalls)
+	}
+	if newClient.initializeCalls != 1 {
+		t.Fatalf("expected replacement stdio client to initialize once, got %d", newClient.initializeCalls)
+	}
+	if newClient.startCalls != 0 {
+		t.Fatalf("expected replacement stdio client to preserve automatic start behavior, got start=%d", newClient.startCalls)
 	}
 }
 
@@ -267,6 +410,21 @@ func TestAddToMCPServerRetriesTransientStartError(t *testing.T) {
 	}
 	if startupClient.initializeCalls != 1 {
 		t.Fatalf("expected startup client initialize once after start recovered, got %d", startupClient.initializeCalls)
+	}
+}
+
+func TestStdioClientNeedsPingHealthCheck(t *testing.T) {
+	_, needPing, needManualStart, err := buildUpstreamClient(&MCPClientConfigV2{
+		Command: "true",
+	})
+	if err != nil {
+		t.Fatalf("expected stdio client to build, got error: %v", err)
+	}
+	if !needPing {
+		t.Fatal("expected stdio client to enable ping health checks")
+	}
+	if needManualStart {
+		t.Fatal("expected stdio client to keep existing automatic start behavior")
 	}
 }
 

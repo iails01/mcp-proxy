@@ -47,6 +47,7 @@ type Client struct {
 
 var transientConnectRetryDelay = 2 * time.Second
 var transientConnectMaxAttempts = 4
+var healthCheckTimeout = 10 * time.Second
 
 func buildUpstreamClient(conf *MCPClientConfigV2) (upstreamClient, bool, bool, error) {
 	clientInfo, pErr := parseMCPClientConfigV2(conf)
@@ -64,7 +65,7 @@ func buildUpstreamClient(conf *MCPClientConfigV2) (upstreamClient, bool, bool, e
 			return nil, false, false, err
 		}
 
-		return mcpClient, false, false, nil
+		return mcpClient, true, false, nil
 	case *SSEMCPClientConfig:
 		var options []transport.ClientOption
 		if len(v.Headers) > 0 {
@@ -145,9 +146,12 @@ func (c *Client) shouldReconnect(err error) bool {
 		"no active sse connection",
 		"connection has been closed",
 		"transport has been closed",
+		"transport closed",
 		"transport not started yet",
 		"endpoint not received",
 		"sse stream error",
+		"unauthorized (401)",
+		"status 401",
 		"unexpected status code: 429",
 		"unexpected status code: 503",
 		"concurrent request count exceeded",
@@ -371,9 +375,28 @@ func (c *Client) startPingTask(ctx context.Context) {
 }
 
 func (c *Client) pingOnce(ctx context.Context, failCount *int) {
-	if err := c.ping(ctx); err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	pingCtx := ctx
+	var cancel context.CancelFunc
+	if healthCheckTimeout > 0 {
+		pingCtx, cancel = context.WithTimeout(ctx, healthCheckTimeout)
+		defer cancel()
+	}
+
+	if err := c.ping(pingCtx); err != nil {
+		if errors.Is(err, context.Canceled) && ctx.Err() != nil {
 			return
+		}
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			log.Printf("<%s> Reconnect triggered after health-check timeout: %v", c.name, err)
+			if reconnectErr := c.reconnect(ctx); reconnectErr == nil {
+				if *failCount > 0 {
+					log.Printf("<%s> MCP Ping recovered after %d failures", c.name, *failCount)
+					*failCount = 0
+				}
+				return
+			} else {
+				err = errors.Join(err, fmt.Errorf("reconnect failed: %w", reconnectErr))
+			}
 		}
 		if c.shouldReconnect(err) {
 			log.Printf("<%s> Ping returned reconnect-worthy error after wrapper: %v", c.name, err)
